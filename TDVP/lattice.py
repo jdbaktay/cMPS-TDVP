@@ -1,10 +1,10 @@
 import numpy as np
 import scipy.linalg as la
-from scipy.sparse.linalg import eigs
+from scipy.sparse.linalg import eigs,bicg,gmres
 from scipy.sparse.linalg.interface import IdentityOperator
 from itertools import product
 # local imports
-from .tools import SuperOperator
+from .tools import SuperOperator,Projector
 # debugging
 import matplotlib.pyplot as plt
 
@@ -18,13 +18,16 @@ class Lattice_TDVP(object):
         
         if A0 is None:
             A0 = np.random.normal(0,1,size=(d*D,D))+1j*np.random.normal(0,1,size=(d*D,D))
+            A0,_ = la.qr(A0.reshape((-1,D)),mode="economic")
+            A0 = A0.reshape((d,D,D))
 
         self._A = A0.copy()
         self._canonical_form=False
         
     @property
     def En(self):
-        return self._En.real
+        self.canonical_form()
+        return self._En
     
     
     @property
@@ -47,8 +50,7 @@ class Lattice_TDVP(object):
 
     @property
     def A(self):
-        if not self._canonical_form:
-            self.canonical_form()
+        self.canonical_form()
         
         A_view = self._A[...]
         
@@ -58,8 +60,7 @@ class Lattice_TDVP(object):
     
     @property
     def l(self):
-        if not self._canonical_form:
-            self.canonical_form()
+        self.canonical_form()
         
         l_view = self._l[:]
         
@@ -69,8 +70,7 @@ class Lattice_TDVP(object):
 
     @property
     def r(self):
-        if not self._canonical_form:
-            self.canonical_form()
+        self.canonical_form()
         
         r_view = self._r[:]
         
@@ -84,9 +84,25 @@ class Lattice_TDVP(object):
 
         if not self._canonical_form:
 
-            A,_ = la.qr(self._A.reshape((-1,D)),mode="economic")
-            A = A.reshape((d,D,D))
-            
+            A = self._A
+
+            E_op = SuperOperator(A[0],A[0].conj())
+            for s in range(1,d,1):
+                E_op += SuperOperator(A[s],A[s].conj())
+
+
+            [e],l = eigs(E_op.T,k=1,which="LR",maxiter=100000)
+
+            A = A/np.sqrt(e)
+
+            l = l.reshape((D,D))
+            l /= np.trace(l)
+
+            L = la.cholesky(l)
+            L_inv = la.inv(L)
+
+            A = np.matmul(L,np.matmul(A,L_inv))
+
             E_op = SuperOperator(A[0],A[0].conj())
             for s in range(1,d,1):
                 E_op += SuperOperator(A[s],A[s].conj())
@@ -95,9 +111,10 @@ class Lattice_TDVP(object):
 
             r = r.reshape((D,D))
             r /= np.trace(r)
+
             p,v = la.eigh(r)
 
-            self._A = np.matmul(v.T.conj(),np.matmul(A,v))/np.sqrt(e)
+            self._A = np.matmul(v.T.conj(),np.matmul(A,v))
 
             self._r = p.ravel() / p.sum()
             self._l = np.ones_like(p)
@@ -105,10 +122,11 @@ class Lattice_TDVP(object):
             self._En = 0
 
             A = self._A
+
             for s,t,u,v in product(*(4*[range(d)])):
                 X = np.dot(A[s],A[t])
                 Y = np.dot(A[u],A[v])
-                self._En += self._h_loc[s,t,u,v] * np.trace(np.dot(X.T.conj(),Y) * self._r)
+                self._En += self._h_loc[s,t,u,v] * np.sum((X.conj() * Y).T * r)
 
             self._canonical_form = True
 
@@ -128,9 +146,10 @@ class Lattice_TDVP(object):
         sqrt_l = np.sqrt(l)
 
         # getting null space
-        L = (Ac.transpose(0,2,1) * sqrt_l).reshape((D,d*D))
+        L = ((Ac.transpose(0,2,1)*sqrt_l).transpose(1,0,2)).reshape((D,d*D))
         VL = la.null_space(L)
         VL = VL.reshape((d,D,D*(d-1)))
+        # VL = VL.transpose((1,0,2))
 
         # getting transfer operator
         E = SuperOperator(A[0],Ac[0])
@@ -142,7 +161,7 @@ class Lattice_TDVP(object):
         lH = np.zeros((D,D),dtype=np.complex128)
 
         for s,t,u,v in product(*(4*[range(d)])):
-            X = np.dot(Ac[t].T,Ac[s].T)
+            X = np.dot(Ac[s],Ac[t]).T # = (A[s],A[t]).T.conj()
             Y = np.dot(A[u],A[v])
 
             # np.dot(X*l,Y) equiv to np.dot(X,np.dot(np.diag(l),Y))
@@ -150,31 +169,28 @@ class Lattice_TDVP(object):
 
             C[s,t] += h_loc[s,t,u,v] * Y
 
-        h = np.sum(np.diag(lH)*r)
-
+        h = np.sum(np.diagonal(lH)*r)
         diag_ind = np.diag_indices_from(lH)
-
-        K0 = lH.copy()
-
-        K0[diag_ind] -= h*l
+        lH[diag_ind] -= h*l
 
         # getting K
-        K = np.random.normal(0,1,size=(D,D))
-        # np.trace(K.dot(np.diag(r)))
-        TrKr = np.sum(np.diag(K)*r)
+        U = IdentityOperator(shape=E.shape) - E + Projector(r,l)
 
-        while( np.abs(TrKr) > 1e-7):
+        # K,e = bicg(U.H,lH.ravel())
+        K,e = gmres(U.H,lH.ravel())
+        K = K.reshape((D,D))
+        K = K.T.conj()
 
-            K = E.dot(K.ravel()).reshape((D,D)) + K0 
-            K[diag_ind] -= TrKr*l
-            TrKr = np.sum(np.diag(K)*r)
-            # print(TrKr,K)
 
         # getting F
         F = np.zeros((D*(d-1),D),dtype=np.complex128)
 
-        for s,t in product(*(2*[range(self.d)])):
+        for s in range(d):
             Temp = (VL[t].T.conj()) * sqrt_l
+            for t in range(d)
+                
+        for s,t in product(*(2*[range(d)])):
+            
             Temp = np.dot(Temp,C[s,t])
             Temp *= r
             Temp = np.dot(Temp,Ac[s].T)
@@ -189,7 +205,8 @@ class Lattice_TDVP(object):
             F += np.dot(VL[s].T.conj()/sqrt_l,Temp*sqrt_r)
 
 
-        B = (np.matmul(VL,F.T.conj()/sqrt_r).transpose(0,2,1) / sqrt_l).transpose(0,2,1)
+        B = np.matmul(VL,F.T.conj())
+        B = ((B / sqrt_r).transpose(0,2,1) / sqrt_l).transpose(0,2,1)
 
         return B
 
@@ -199,7 +216,6 @@ class Lattice_TDVP(object):
         self._A -= dtau*B
 
         self._canonical_form=False
-        self.canonical_form()
 
         return dtau*B
 
