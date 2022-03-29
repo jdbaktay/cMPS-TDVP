@@ -4,7 +4,7 @@ from scipy.sparse.linalg import eigs,bicg,gmres
 from scipy.sparse.linalg.interface import IdentityOperator
 from itertools import product
 # local imports
-from .tools import SuperOperator,Projector
+from .tools import SuperOperator,TransferMatrix,Projector
 # debugging
 import matplotlib.pyplot as plt
 
@@ -86,12 +86,11 @@ class Lattice_TDVP(object):
 
             A = self._A
 
-            E_op = SuperOperator(A[0],A[0].conj())
-            for s in range(1,d,1):
-                E_op += SuperOperator(A[s],A[s].conj())
+            E_op = TransferMatrix(A)
 
 
             [e],l = eigs(E_op.T,k=1,which="LR",maxiter=100000)
+            [e],r = eigs(E_op  ,k=1,which="LR",maxiter=100000)
 
             A = A/np.sqrt(e)
 
@@ -103,12 +102,6 @@ class Lattice_TDVP(object):
 
             A = np.matmul(L,np.matmul(A,L_inv))
 
-            E_op = SuperOperator(A[0],A[0].conj())
-            for s in range(1,d,1):
-                E_op += SuperOperator(A[s],A[s].conj())
-
-            [e],r = eigs(E_op,k=1,which="LR")
-
             r = r.reshape((D,D))
             r /= np.trace(r)
 
@@ -116,22 +109,70 @@ class Lattice_TDVP(object):
 
             self._A = np.matmul(v.T.conj(),np.matmul(A,v))
 
-            self._r = p.ravel() / p.sum()
-            self._l = np.ones_like(p)
+            self._r = np.diag(p) / p.sum()
+            self._l = np.diag(np.ones_like(p))
 
-            self._En = 0
-
-            A = self._A
-
-            for s,t,u,v in product(*(4*[range(d)])):
-                X = np.dot(A[s],A[t])
-                Y = np.dot(A[u],A[v])
-                self._En += self._h_loc[s,t,u,v] * np.sum((X.conj() * Y).T * r)
+            self._En = np.einsum("qij,rjk,skm,tmi,qrst,k->",A,A,Ac,Ac,self.h_loc,p)
 
             self._canonical_form = True
 
     
-                
+    def solve_B(self):
+        D = self.D
+        d = self.d
+        A = self.A
+        Ac = A.conj()
+        h_loc = self.h_loc
+
+        r = self.r
+        l = self.l
+
+
+        if d*D**3 <= D**6:
+            E = TransferMatrix(A)
+            O = IdentityOperator(shape=E.shape) - E + Projector(np.diagonal(self.r),np.diagonal(self.l))
+        else:
+            E = np.tensordot(A,A.conj(),axes=(0,0))
+            E = E.transpose(0,2,1,3).reshape(D**2,D**2)
+            rl = np.outer(r.ravel(),l.T.ravel())
+
+            O = np.eye(*E.shape) - E + rl
+
+
+        th = np.tensordot(A.T, A, axes=(0,1))
+
+        th = np.tensordot(th,self.h_loc,axes=([1,2],[0,1])).transpose(0,2,3,1)
+
+        Ac = A.conj()
+        lAc = np.tensordot(l.T,Ac,axes=(1,0))
+        Acr = np.tensordot(Ac,r,axes=(2,0))
+
+        F1 = np.tensordot(th,Acr,axes=([2,3],[0,2]))
+
+        hR = np.tensordot(F1,Ac,axes=([1,2],[0,2]))
+        F1 = np.tensordot(l.T,F1,axes=(1,0))
+
+        F2 = np.tensordot(lAc,th,axes=([1,0],[0,1]))
+
+        hL = np.tensordot(F2,Ac,axes=([0,1],[1,0]))
+        F2 = np.tensordot(F2,r,axes=(2,0))
+
+
+
+        self._En = np.sum(np.diagonal(hL)*np.diagonal(r))
+        Lh,*_ = solve_system(O.T,hL)
+        Rh,*_ = solve_system(O,hR)
+
+        Rh = Rh.reshape(D,D)
+        Lh = Lh.reshape(D,D)
+
+        F3 = np.matmul(l.T,np.matmul(A,Rh))
+        F4 = np.matmul(Lh.T,np.matmul(A,l))
+
+
+
+
+"""
     def solve_B(self):
         D = self.D
         d = self.d
@@ -209,7 +250,7 @@ class Lattice_TDVP(object):
         B = ((B / sqrt_r).transpose(0,2,1) / sqrt_l).transpose(0,2,1)
 
         return B
-
+"""
     def imag_time_step(self,dtau):
         B = self.solve_B()
 

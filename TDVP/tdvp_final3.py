@@ -228,7 +228,7 @@ static = [["zz|",J_rung_list],["|zz",J_ring_list],["z|z",J_rung_list],
 			["x|",h_list],["|x",h_list]]
 
 h = hamiltonian(static,[],basis=basis,dtype=np.float64)
-D, d, dt, N = 10, basis_ring.Ns, 0.001, 2500
+D, d, dt, N = 100, basis_ring.Ns, 0.01, 2500
 
 
 

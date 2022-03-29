@@ -1,7 +1,10 @@
 import numpy as np
-from scipy.sparse.linalg import LinearOperator
+import numba as nb
 
-__all__ = ["SuperOperator","Projector"]
+from scipy.sparse.linalg import LinearOperator
+import cProfile
+
+__all__ = ["SuperOperator","Projector","TransferMatrix"]
 
 
 class SuperOperator(LinearOperator):
@@ -10,6 +13,8 @@ class SuperOperator(LinearOperator):
     def __init__(self,A=None,B=None):
         self._A = A
         self._B = B
+        self._Ac = A.conj()
+        self._Bc = B.conj()
 
         try:
             self._N = A.shape[0]**2
@@ -47,15 +52,64 @@ class SuperOperator(LinearOperator):
         if self._B is None:
             Temp = other
         else:
-            Temp = np.dot(other,self._B.conj())
+            Temp = np.dot(other,self._Bc)
             
         if self._A is None:
             pass
         else:
-            Temp = np.matmul(self._A.T.conj(),Temp).ravel()
+            Temp = np.dot(self._Ac.T,Temp).ravel()
         
         return Temp
 
+@nb.njit
+def _Transfer_matrix_core(other,A):
+    d = A.shape[0]
+
+    out = np.dot(A[0],np.dot(other,A[0].T.conj()))
+    for s in range(1,d):
+        out += np.dot(A[s],np.dot(other,A[s].T.conj()))
+
+    return out
+
+@nb.njit
+def _Transfer_matrix_core_hc(other,A):
+    d = A.shape[0]
+
+    out = np.dot(A[0].T.conj(),np.dot(other,A[0]))
+    for s in range(1,d):
+        out += np.dot(A[s].T.conj(),np.dot(other,A[s]))
+
+    return out
+
+class TransferMatrix(LinearOperator):
+    # operator sum(np.kron(A[s],A[s].conj()) for s in range(A.shape[0]))
+    
+    def __init__(self,A):
+        if A.ndim != 3:
+            raise ValueError("expecting a 3-tensor for A")
+
+        self._D = A.shape[1]
+        self._N = self._D**2
+        self._A = A
+
+        
+    @property
+    def dtype(self):
+        return np.dtype(self._A.dtype)
+        
+    @property
+    def shape(self):
+        return (self._N,self._N)
+  
+    def _matvec(self,other):
+        other = other.reshape(self._A[0].shape)
+        other = other.astype(np.result_type(other.dtype,self.dtype))
+        return _Transfer_matrix_core(other,self._A).ravel()
+    
+    def _rmatvec(self,other):
+        other = other.reshape(self._A[0].shape)
+        other = other.astype(np.result_type(other.dtype,self.dtype))
+        return _Transfer_matrix_core_hc(other,self._A).ravel()    
 
 
 class Projector(LinearOperator):
@@ -108,3 +162,29 @@ class Projector(LinearOperator):
             return np.diag(self._r.conj() * l_other).ravel()
         else:
             return (self._r.conj() * l_other).ravel()
+
+
+
+if __name__ == '__main__':
+    d = 2**4
+    D = 10
+
+    A = np.random.normal(0,1,size=(d,D,D))+1j*np.random.normal(0,1,size=(d,D,D))
+
+    E = SuperOperator(A[0],A[0].conj())
+    for s in range(1,d,1):
+        E += SuperOperator(A[s],A[s].conj())
+
+    E_2 = TransferMatrix(A)
+
+    v = np.random.normal(0,1,size=(D**2,))
+
+    r = E.dot(v)
+    r_2 = E_2.dot(v)
+
+    print(r-r_2)
+
+    r = E.T.dot(v)
+    r_2 = E_2.T.dot(v)
+
+    print(r-r_2)    
